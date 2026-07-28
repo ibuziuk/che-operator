@@ -204,7 +204,8 @@ type WarmPoolConfig struct {
 - Dashboard UI for creating/managing agent sandboxes
 - Unified routing through Che gateway
 - Integration with Che authentication/authorization
-- Templates for common agent types (code execution, testing, build)
+- Templates for common agent types (code execution, testing, build, editor)
+- Gateway-routed editor access for human-in-the-loop review (`/agent/<name>/editor/`)
 - Metrics and monitoring for agent sandboxes
 - Agent-to-workspace communication patterns
 
@@ -316,8 +317,52 @@ spec:
                 memory: "2Gi"
 ```
 
-**2. Testing Agent**
-**3. Build Agent**
+**2. Editor Agent**
+```yaml
+apiVersion: agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: che-editor-agent
+  namespace: {{ .Namespace }}
+spec:
+  sandboxTemplate:
+    spec:
+      podTemplate:
+        spec:
+          runtimeClassName: {{ .RuntimeClassName }}
+          initContainers:
+          - name: inject-editor
+            image: {{ .EditorImage }}
+            command: ["cp", "-r", "/editor/.", "/injected-editor/"]
+            volumeMounts:
+            - name: editor-volume
+              mountPath: /injected-editor
+          containers:
+          - name: agent
+            image: {{ .AgentImage }}
+            ports:
+            - containerPort: 8080
+              name: editor
+            env:
+            - name: EDITOR_PATH
+              value: /editor
+            volumeMounts:
+            - name: editor-volume
+              mountPath: /editor
+            resources:
+              requests:
+                cpu: "500m"
+                memory: "1Gi"
+              limits:
+                cpu: "4000m"
+                memory: "8Gi"
+          volumes:
+          - name: editor-volume
+            emptyDir: {}
+```
+
+**3. Testing Agent**
+**4. Build Agent**
 
 ### RBAC Configuration
 
@@ -336,6 +381,98 @@ rules:
   resources: ["sandboxtemplates"]
   verbs: ["get", "list"]
 ```
+
+### Editor Integration
+
+AI agents often need an editor surface — both for human inspection of agent-produced code and for agents that use an editor API directly (e.g., code navigation, refactoring tools). Three approaches are available, in increasing integration depth:
+
+#### Option A: Baked-in Editor Image (Phase 2 — simplest)
+
+Include the editor (e.g., `code-server`, VS Code Server) directly in the agent container image. A dedicated `che-editor-agent` SandboxTemplate (see above) ships with the editor pre-installed.
+
+**Pros:**
+- Fits agent-sandbox's single-container focus
+- No additional Kubernetes primitives required
+- Straightforward to configure via `SandboxTemplate`
+
+**Cons:**
+- Editor version is coupled to the agent image release cycle
+- Larger image size
+- Cannot swap editor independently of agent runtime
+
+#### Option B: Init Container Injection (Phase 2 — recommended)
+
+Copy editor binaries from a standalone editor image into a shared `emptyDir` volume before the agent container starts. This mirrors the init container pattern already used in che-operator (e.g., database readiness gating).
+
+```
+┌─────────────────────────────────────────────┐
+│  Pod (agent sandbox)                         │
+│                                              │
+│  ┌──────────────────┐   emptyDir volume      │
+│  │  init: inject-   │ ─────────────────────► │
+│  │  editor          │   /editor binaries      │
+│  └──────────────────┘                        │
+│                                              │
+│  ┌──────────────────┐                        │
+│  │  agent container │ ◄──── mounts /editor   │
+│  │  (runtime)       │                        │
+│  └──────────────────┘                        │
+└─────────────────────────────────────────────┘
+```
+
+The `AgentRuntimesConfiguration` API gains an `editorImage` field to control which editor is injected:
+
+```go
+type AgentRuntimesConfiguration struct {
+    // ... existing fields
+
+    // EditorImage is the container image used to inject editor binaries
+    // into agent sandboxes via init container. Defaults to the Che editor image.
+    // +optional
+    // +kubebuilder:default:="quay.io/che-incubator/che-code:latest"
+    EditorImage string `json:"editorImage,omitempty"`
+
+    // InjectEditor controls whether an editor is injected into agent sandboxes
+    // created from the che-editor-agent template.
+    // +optional
+    // +kubebuilder:default:=false
+    InjectEditor bool `json:"injectEditor,omitempty"`
+}
+```
+
+**Pros:**
+- Editor image and agent image evolve independently
+- Consistent with existing che-operator init container patterns
+- Editor can be updated by changing a single field in `CheCluster`
+
+**Cons:**
+- Requires confirming agent-sandbox `podTemplate` supports `initContainers`
+- Init container failure blocks sandbox startup
+
+**Verification needed:** Confirm the agent-sandbox `Sandbox` CRD allows `initContainers` in its `podTemplate` spec — the current comparison table notes "single container focus" for agent-sandbox (see [DevWorkspace vs Agent Sandbox](#devworkspace-vs-agent-sandbox)).
+
+#### Option C: Gateway-Routed Editor (Phase 3)
+
+Extend Che gateway routing to proxy editor traffic to agent sandboxes, making the editor accessible at `https://che-host/agent/<sandbox-name>/editor/`. This reuses the `AgentSandboxRoutingSolver` described in Option B of Routing Integration below.
+
+```
+Client Browser
+    │
+    ▼
+Che Gateway  →  /agent/my-code-agent/editor/  →  sandbox:8080 (editor)
+                /agent/my-code-agent/api/     →  sandbox:8081 (agent API)
+```
+
+**Pros:**
+- Unified URL space under Che host
+- Reuses Che authentication for editor access
+- Enables human-in-the-loop review of agent work via familiar editor UI
+
+**Cons:**
+- Requires full routing integration (Phase 3 effort)
+- More complex CORS and proxy configuration
+
+**Recommendation:** Implement Option B (init container injection) in Phase 2 gated by `InjectEditor: false` default, and plan Option C as part of the Phase 3 routing work.
 
 ### Routing Integration
 
@@ -527,6 +664,15 @@ Later promote to CheCluster API.
 
 6. **Billing/quotas?**  
    How do we attribute agent sandbox resource usage to users/teams?
+
+7. **Editor injection mechanism?**  
+   Should editors be baked into agent images (simple, coupled) or injected via init containers (flexible, decoupled)? Does the agent-sandbox `podTemplate` spec support `initContainers`, or is "single container focus" a hard constraint in the CRD?
+
+8. **Which editors to support?**  
+   Should che-operator default to `che-code` (VS Code-based) only, or also support Theia and other Che editors? Should the `editorImage` default match whatever editor is configured in `CheCluster.spec.components.cheServer`?
+
+9. **Human-in-the-loop editor access?**  
+   If an agent sandbox exposes an editor, how should human users authenticate to reach it — Che SSO, a time-limited token, or direct service access?
 
 ## Alternatives Considered
 
